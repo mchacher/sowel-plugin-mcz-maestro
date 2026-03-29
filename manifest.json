@@ -1,0 +1,34 @@
+{
+  "id": "mcz_maestro",
+  "name": "MCZ Maestro",
+  "version": "1.0.0",
+  "description": "MCZ pellet stoves via Maestro cloud (Socket.IO)",
+  "icon": "Flame",
+  "repo": "mchacher/sowel-plugin-mcz-maestro",
+  "author": "mchacher",
+  "sowelVersion": ">=0.10.0",
+  "settings": [
+    {
+      "key": "serial_number",
+      "label": "Serial number",
+      "type": "text",
+      "required": true,
+      "placeholder": "e.g. 1234567890"
+    },
+    {
+      "key": "mac_address",
+      "label": "MAC address",
+      "type": "text",
+      "required": true,
+      "placeholder": "e.g. AA:BB:CC:DD:EE:FF"
+    },
+    {
+      "key": "polling_interval",
+      "label": "Polling interval (seconds)",
+      "type": "number",
+      "required": false,
+      "defaultValue": "300",
+      "placeholder": "Min 60, default 300"
+    }
+  ]
+}
