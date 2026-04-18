@@ -34,7 +34,7 @@ interface DiscoveredDevice {
   model?: string;
   rawExpose?: Record<string, unknown>;
   data: { key: string; type: string; category: string; unit?: string }[];
-  orders: { key: string; type: string; dispatchConfig: Record<string, unknown>; min?: number; max?: number; enumValues?: string[]; unit?: string }[];
+  orders: { key: string; type: string; dispatchConfig?: Record<string, unknown>; min?: number; max?: number; enumValues?: string[]; unit?: string }[];
 }
 
 interface DeviceManager {
@@ -51,9 +51,10 @@ interface IntegrationSettingDef { key: string; label: string; type: "text" | "pa
 
 interface IntegrationPlugin {
   readonly id: string; readonly name: string; readonly description: string; readonly icon: string;
+  readonly apiVersion?: number;
   getStatus(): IntegrationStatus; isConfigured(): boolean; getSettingsSchema(): IntegrationSettingDef[];
   start(options?: { pollOffset?: number }): Promise<void>; stop(): Promise<void>;
-  executeOrder(device: Device, dispatchConfig: Record<string, unknown>, value: unknown): Promise<void>;
+  executeOrder(device: Device, orderKeyOrDispatchConfig: string | Record<string, unknown>, value: unknown): Promise<void>;
   refresh?(): Promise<void>; getPollingInfo?(): { lastPollAt: string; intervalMs: number } | null;
 }
 
@@ -82,6 +83,14 @@ const COMMAND_ID = {
   POWER: 34, POWER_LEVEL: 36, FAN_AMBIENT: 37, REGULATION_MODE: 40,
   ECO_MODE: 41, TARGET_TEMPERATURE: 42, SILENCE_MODE: 45, PROFILE: 149, RESET_ALARM: 1,
 } as const;
+
+const ORDER_KEY_TO_COMMAND: Record<string, number> = {
+  power: COMMAND_ID.POWER,
+  targetTemperature: COMMAND_ID.TARGET_TEMPERATURE,
+  profile: COMMAND_ID.PROFILE,
+  ecoMode: COMMAND_ID.ECO_MODE,
+  resetAlarm: COMMAND_ID.RESET_ALARM,
+};
 
 const POWER_ON_VALUE = 1;
 const POWER_OFF_VALUE = 40;
@@ -278,6 +287,7 @@ class MczMaestroPlugin implements IntegrationPlugin {
   readonly name = "MCZ Maestro";
   readonly description = "MCZ pellet stoves via Maestro cloud";
   readonly icon = "Flame";
+  readonly apiVersion = 2;
 
   private logger: Logger;
   private eventBus: EventBus;
@@ -370,11 +380,11 @@ class MczMaestroPlugin implements IntegrationPlugin {
     this.logger.info("MCZ Maestro stopped");
   }
 
-  async executeOrder(_device: Device, dispatchConfig: Record<string, unknown>, value: unknown): Promise<void> {
+  async executeOrder(_device: Device, orderKey: string, value: unknown): Promise<void> {
     if (!this.bridge || this.status !== "connected") throw new Error("MCZ Maestro not connected");
 
-    const commandId = dispatchConfig.commandId as number;
-    if (commandId === undefined) throw new Error("Missing commandId in dispatch config");
+    const commandId = ORDER_KEY_TO_COMMAND[orderKey];
+    if (commandId === undefined) throw new Error(`Unknown order key: ${orderKey}`);
 
     let rawValue: number;
     switch (commandId) {
@@ -387,7 +397,7 @@ class MczMaestroPlugin implements IntegrationPlugin {
     }
 
     await this.bridge.sendCommand(commandId, rawValue);
-    this.logger.info({ commandId, value, rawValue }, "MCZ order executed");
+    this.logger.info({ orderKey, commandId, value, rawValue }, "MCZ order executed");
     this.scheduleOnDemandPoll();
   }
 
@@ -482,10 +492,10 @@ function mapFrameToDiscovered(serial: string, _frame: MczStatusFrame): Discovere
     manufacturer: "MCZ",
     model: "Maestro",
     data: [
-      { key: "power", type: "boolean", category: "generic" },
+      { key: "power", type: "boolean", category: "power" },
       { key: "stoveState", type: "enum", category: "generic" },
       { key: "insideTemperature", type: "number", category: "temperature", unit: "°C" },
-      { key: "targetTemperature", type: "number", category: "temperature", unit: "°C" },
+      { key: "targetTemperature", type: "number", category: "setpoint", unit: "°C" },
       { key: "profile", type: "enum", category: "generic" },
       { key: "ecoMode", type: "boolean", category: "generic" },
       { key: "pelletSensor", type: "enum", category: "generic" },
@@ -493,11 +503,11 @@ function mapFrameToDiscovered(serial: string, _frame: MczStatusFrame): Discovere
       { key: "sparkPlug", type: "enum", category: "generic" },
     ],
     orders: [
-      { key: "power", type: "boolean", dispatchConfig: { commandId: COMMAND_ID.POWER } },
-      { key: "targetTemperature", type: "number", dispatchConfig: { commandId: COMMAND_ID.TARGET_TEMPERATURE }, min: 5, max: 40, unit: "°C" },
-      { key: "profile", type: "enum", dispatchConfig: { commandId: COMMAND_ID.PROFILE }, enumValues: [...ORDER_PROFILE_VALUES] },
-      { key: "ecoMode", type: "boolean", dispatchConfig: { commandId: COMMAND_ID.ECO_MODE } },
-      { key: "resetAlarm", type: "boolean", dispatchConfig: { commandId: COMMAND_ID.RESET_ALARM } },
+      { key: "power", type: "boolean" },
+      { key: "targetTemperature", type: "number", min: 5, max: 40, unit: "°C" },
+      { key: "profile", type: "enum", enumValues: [...ORDER_PROFILE_VALUES] },
+      { key: "ecoMode", type: "boolean" },
+      { key: "resetAlarm", type: "boolean" },
     ],
     rawExpose: {
       stoveStates: ["off", "checking", "stabilizing", "running", "running_p1", "running_p2", "running_p3", "running_p4", "running_p5", "diagnostic", "extinguishing", "cooling", "standby", "auto_eco"],
