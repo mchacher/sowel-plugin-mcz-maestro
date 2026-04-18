@@ -34,7 +34,7 @@ interface DiscoveredDevice {
   model?: string;
   rawExpose?: Record<string, unknown>;
   data: { key: string; type: string; category: string; unit?: string }[];
-  orders: { key: string; type: string; dispatchConfig?: Record<string, unknown>; min?: number; max?: number; enumValues?: string[]; unit?: string }[];
+  orders: { key: string; type: string; category?: string; dispatchConfig?: Record<string, unknown>; min?: number; max?: number; enumValues?: string[]; unit?: string }[];
 }
 
 interface DeviceManager {
@@ -503,8 +503,8 @@ function mapFrameToDiscovered(serial: string, _frame: MczStatusFrame): Discovere
       { key: "sparkPlug", type: "enum", category: "generic" },
     ],
     orders: [
-      { key: "power", type: "boolean" },
-      { key: "targetTemperature", type: "number", min: 5, max: 40, unit: "°C" },
+      { key: "power", type: "boolean", category: "toggle_power" },
+      { key: "targetTemperature", type: "number", category: "set_setpoint", min: 5, max: 40, unit: "°C" },
       { key: "profile", type: "enum", enumValues: [...ORDER_PROFILE_VALUES] },
       { key: "ecoMode", type: "boolean" },
       { key: "resetAlarm", type: "boolean" },
