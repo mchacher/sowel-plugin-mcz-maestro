@@ -3,6 +3,7 @@
  *
  * Integrates MCZ pellet stoves via the Maestro cloud (Socket.IO on app.mcz.it:9000).
  * Polls stove status, executes commands (power, temperature, profile, eco mode, reset alarm).
+ * Optionally puts the stove back in a chosen profile and eco mode each time it starts.
  */
 
 import { io, type Socket } from "socket.io-client";
@@ -130,6 +131,69 @@ function isStoveActive(stoveState: string): boolean {
   if (offStates.includes(stoveState)) return false;
   if (stoveState.startsWith("error_") || stoveState.startsWith("unknown_")) return false;
   return true;
+}
+
+/** Stopped for good: switched off, or halted by an alarm. A pause in eco or standby is not. */
+function isStopped(stoveState: string): boolean {
+  return stoveState === "off" || stoveState.startsWith("error_");
+}
+
+/**
+ * Whether the stove has just been started, between two polls: it was off or
+ * in alarm, and is now active, whichever step it reached (a short ignition can
+ * fall between two polls).
+ *
+ * Relighting after a pause in eco or standby is not a start: the stove keeps
+ * its profile through it, and a profile chosen by hand must survive it. The
+ * first poll after the plugin starts has no previous state and is never a
+ * start either: the stove may have been running for hours.
+ */
+export function isStartup(previous: string | null, current: string): boolean {
+  if (previous === null) return false;
+  return isStopped(previous) && isStoveActive(current);
+}
+
+/** What to put the stove back in at each start. An absent field is left as it is. */
+export interface StartupMode {
+  profile?: (typeof ORDER_PROFILE_VALUES)[number];
+  ecoMode?: boolean;
+}
+
+/** Read the start-up settings. Unknown values are reported and left out. */
+export function parseStartupMode(
+  profileSetting: string | undefined,
+  ecoSetting: string | undefined,
+): { mode: StartupMode; invalid: string[] } {
+  const mode: StartupMode = {};
+  const invalid: string[] = [];
+  const profile = profileSetting?.trim().toLowerCase() ?? "";
+  if (profile) {
+    if ((ORDER_PROFILE_VALUES as readonly string[]).includes(profile)) {
+      mode.profile = profile as StartupMode["profile"];
+    } else {
+      invalid.push(`startup_profile=${profileSetting}`);
+    }
+  }
+  const eco = ecoSetting?.trim().toLowerCase() ?? "";
+  if (eco === "on") mode.ecoMode = true;
+  else if (eco === "off") mode.ecoMode = false;
+  else if (eco) invalid.push(`startup_eco_mode=${ecoSetting}`);
+  return { mode, invalid };
+}
+
+/** The commands that bring the stove to the start-up mode, none when it is already there. */
+export function startupCommands(
+  frame: Pick<MczStatusFrame, "profile" | "ecoMode">,
+  mode: StartupMode,
+): { orderKey: string; commandId: number; rawValue: number }[] {
+  const commands: { orderKey: string; commandId: number; rawValue: number }[] = [];
+  if (mode.profile !== undefined && frame.profile !== profileToRaw(mode.profile)) {
+    commands.push({ orderKey: "profile", commandId: COMMAND_ID.PROFILE, rawValue: profileToRaw(mode.profile) });
+  }
+  if (mode.ecoMode !== undefined && (frame.ecoMode === 1) !== mode.ecoMode) {
+    commands.push({ orderKey: "ecoMode", commandId: COMMAND_ID.ECO_MODE, rawValue: mode.ecoMode ? 1 : 0 });
+  }
+  return commands;
 }
 
 function profileToString(raw: number): string { return PROFILE_VALUES[raw] ?? `unknown_${raw}`; }
@@ -277,6 +341,14 @@ const INTEGRATION_ID = "mcz_maestro";
 const SETTINGS_PREFIX = `integration.${INTEGRATION_ID}.`;
 const DEFAULT_POLL_INTERVAL_MS = 300_000;
 const ON_DEMAND_DELAY_MS = 5_000;
+/** Sends a start makes to reach its mode before giving up. */
+const STARTUP_MODE_ATTEMPTS = 3;
+/**
+ * How long a start stays pending. Its checks run 5 s apart; past this, a
+ * failed check would otherwise leave the next send to the regular poll,
+ * minutes later, into normal running.
+ */
+const STARTUP_MODE_WINDOW_MS = 120_000;
 
 // ============================================================
 // Plugin implementation
@@ -305,6 +377,13 @@ class MczMaestroPlugin implements IntegrationPlugin {
   private retryTimeout: ReturnType<typeof setTimeout> | null = null;
   private retryCount = 0;
   private migrationDone = false;
+  /** The stove state at the last poll, `null` until the first one. */
+  private lastStoveState: string | null = null;
+  private startupMode: StartupMode = {};
+  /** When the start whose mode is not confirmed yet was seen; `null` when none is pending. */
+  private startupSeenAt: number | null = null;
+  /** Sends left for the pending start. */
+  private startupAttemptsLeft = 0;
 
   constructor(deps: PluginDeps) {
     this.logger = deps.logger;
@@ -328,6 +407,8 @@ class MczMaestroPlugin implements IntegrationPlugin {
       { key: "serial_number", label: "Serial number", type: "text", required: true, placeholder: "e.g. 1234567890" },
       { key: "mac_address", label: "MAC address", type: "text", required: true, placeholder: "e.g. AA:BB:CC:DD:EE:FF" },
       { key: "polling_interval", label: "Polling interval (seconds)", type: "number", required: false, defaultValue: "300", placeholder: "Min 60, default 300" },
+      { key: "startup_profile", label: "Profile at each start", type: "text", required: false, placeholder: "comfort, dynamic or overnight (empty: unchanged)" },
+      { key: "startup_eco_mode", label: "Eco mode at each start", type: "text", required: false, placeholder: "on or off (empty: unchanged)" },
     ];
   }
 
@@ -342,6 +423,12 @@ class MczMaestroPlugin implements IntegrationPlugin {
     const macAddress = this.getSetting("mac_address")!;
     const pollingIntervalSec = parseInt(this.getSetting("polling_interval") ?? "300", 10);
     this.pollIntervalMs = (isNaN(pollingIntervalSec) ? 300 : Math.max(pollingIntervalSec, 60)) * 1000;
+
+    const { mode, invalid } = parseStartupMode(this.getSetting("startup_profile"), this.getSetting("startup_eco_mode"));
+    this.startupMode = mode;
+    if (invalid.length > 0) this.logger.warn({ invalid }, "MCZ start-up mode: settings ignored, unknown value");
+    this.lastStoveState = null;
+    this.startupSeenAt = null;
 
     try {
       this.bridge = new MczBridge(this.logger);
@@ -437,6 +524,8 @@ class MczMaestroPlugin implements IntegrationPlugin {
         sparkPlug: sparkPlugToString(frame.sparkPlug),
       });
 
+      await this.applyStartupMode(stoveState, frame);
+
       if (this.pollFailed) {
         this.pollFailed = false;
         this.eventBus.emit({ type: "system.alarm.resolved", alarmId: `poll-fail:${INTEGRATION_ID}`, source: "MCZ Maestro", message: "Communication rétablie" });
@@ -448,6 +537,66 @@ class MczMaestroPlugin implements IntegrationPlugin {
         this.eventBus.emit({ type: "system.alarm.raised", alarmId: `poll-fail:${INTEGRATION_ID}`, level: "error", source: "MCZ Maestro", message: `Poll en échec : ${err instanceof Error ? err.message : String(err)}` });
       }
     } finally { this.polling = false; }
+  }
+
+  /**
+   * After a start (an alarm reset included), put the stove back in the chosen
+   * profile and eco mode: it comes back in manual with eco off. Only at a
+   * start, so a change made while it runs stays as it is. A command is sent
+   * only when the value differs, and checked at the next polls.
+   */
+  private async applyStartupMode(stoveState: string, frame: MczStatusFrame): Promise<void> {
+    const previous = this.lastStoveState;
+    this.lastStoveState = stoveState;
+    if (this.startupMode.profile === undefined && this.startupMode.ecoMode === undefined) return;
+
+    if (isStartup(previous, stoveState)) {
+      this.startupSeenAt = Date.now();
+      this.startupAttemptsLeft = STARTUP_MODE_ATTEMPTS;
+      this.logger.info({ previous, stoveState }, "MCZ stove started");
+    }
+    if (this.startupSeenAt === null) return;
+    if (!isStoveActive(stoveState)) {
+      this.startupSeenAt = null;
+      return;
+    }
+
+    const commands = startupCommands(frame, this.startupMode);
+    if (commands.length > 0 && Date.now() - this.startupSeenAt > STARTUP_MODE_WINDOW_MS) {
+      this.startupSeenAt = null;
+      this.logger.warn(
+        { startupMode: this.startupMode, orders: commands.map((c) => c.orderKey) },
+        "MCZ start-up mode not confirmed in time, left as it is until the next start",
+      );
+      return;
+    }
+    if (commands.length === 0) {
+      this.startupSeenAt = null;
+      this.logger.info({ startupMode: this.startupMode }, "MCZ start-up mode in place");
+      return;
+    }
+    if (this.startupAttemptsLeft === 0) {
+      this.startupSeenAt = null;
+      this.logger.warn(
+        { startupMode: this.startupMode, orders: commands.map((c) => c.orderKey) },
+        "MCZ start-up mode not taken by the stove, giving up until the next start",
+      );
+      return;
+    }
+    if (!this.bridge) return;
+
+    this.startupAttemptsLeft--;
+    try {
+      for (const { commandId, rawValue } of commands) await this.bridge.sendCommand(commandId, rawValue);
+      this.logger.info(
+        { startupMode: this.startupMode, orders: commands.map((c) => c.orderKey) },
+        "MCZ start-up mode sent",
+      );
+    } catch (err) {
+      this.logger.error({ err } as Record<string, unknown>, "MCZ start-up mode could not be sent");
+    }
+    // Checked at the next poll, a few seconds from now.
+    this.scheduleOnDemandPoll();
   }
 
   private safePoll(): void { this.poll().catch((err) => this.logger.error({ err } as Record<string, unknown>, "Poll failed")); }
@@ -520,6 +669,8 @@ function mapFrameToDiscovered(serial: string, _frame: MczStatusFrame): Discovere
 // ============================================================
 // Plugin entry point
 // ============================================================
+
+export { isStoveActive, stoveStateToString };
 
 export function createPlugin(deps: PluginDeps): IntegrationPlugin {
   return new MczMaestroPlugin(deps);
