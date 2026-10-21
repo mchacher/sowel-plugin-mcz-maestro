@@ -22,7 +22,7 @@ jobs:
 
       - run: npm run build
 
-      - run: npm prune --production
+      - run: npm prune --omit=dev && rm -rf node_modules/.vite
 
       - name: Package pre-built tarball
         run: |
